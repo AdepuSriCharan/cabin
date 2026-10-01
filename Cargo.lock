@@ -586,6 +586,7 @@ dependencies = [
  "miette",
  "pubgrub",
  "semver",
+ "serde_json",
  "thiserror",
 ]
 

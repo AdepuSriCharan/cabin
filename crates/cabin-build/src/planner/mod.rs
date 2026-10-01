@@ -259,6 +259,13 @@ fn resolve_dependencies(
         // only.
         let dev_deps_visible = target.kind.is_dev_only();
         for decl in &target.deps {
+            lowering::check_optional_target_dependency(
+                &decl.reference,
+                tid.0,
+                dev_deps_visible,
+                req.graph,
+                enabled_of(tid.0),
+            )?;
             let edge = resolve_target_dep_edge(decl, tid.0, dev_deps_visible, req.graph)?;
             let dep = edge.to.clone();
             // A dep edge is an explicit request: a feature-gated

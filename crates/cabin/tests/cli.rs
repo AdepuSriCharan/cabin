@@ -2271,6 +2271,9 @@ mod dev_dependencies;
 #[path = "cli/optional_dependencies_and_features.rs"]
 mod optional_dependencies_and_features;
 
+#[path = "cli/registry_optional_dependencies.rs"]
+mod registry_optional_dependencies;
+
 #[path = "cli/required_features.rs"]
 mod required_features;
 

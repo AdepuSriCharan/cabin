@@ -263,6 +263,15 @@ translates `semver::VersionReq` into PubGrub's `Ranges<semver::Version>`, implem
 `DependencyProvider` against `cabin_index::PackageIndex`, and handles yanked filtering, locked-mode
 preferences, optional / conditional edges, and candidate ordering.
 
+Feature and optional-dependency nodes are private solver identities tied to their owner's selected
+version. Active edges request defaults and named features additively; their implications add
+optional version requirements to the same PubGrub solve. Backtracking withdraws rejected versions'
+feature implications. Caller-supplied local feature metadata lets patch replacements and their
+path dependencies supply their own feature definitions and outgoing requests. Sparse resolution
+can request an absent index entry from the caller; a confirmed transitive 404 is a backtrackable
+missing candidate. No artifacts are fetched during resolution. The build planner diagnoses target
+references to disabled optional dependencies using the owning manifest's feature declarations.
+
 `ResolveError` implements `miette::Diagnostic` directly so dependency resolution failures are
 rendered through Cabin's miette-based diagnostics layer.  Lockfile errors stay specific - the
 resolver preserves `LockfileMissingPackage`, `LockedVersionMissing`, `LockedVersionYanked`,

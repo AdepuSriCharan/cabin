@@ -321,11 +321,10 @@ pub fn resolve_features(
 /// non-optional dependencies reached under *every* possible
 /// incoming edge request - are `included`.  The real request
 /// belongs to the dependents' edges (`features` /
-/// `default-features`), which the callers' resolution layer does
-/// not interpret for index edges - and assuming any particular
-/// request (defaults, say) would include packages the real edges
-/// disable.  Exact, edge-aware consumers must re-resolve over the
-/// final graph once those edges are known.
+/// `default-features`), which this isolated pass cannot see. Assuming
+/// defaults would include packages the real edges disable. The version
+/// resolver applies actual index-edge requests using caller-supplied
+/// local feature metadata; building commands also resolve over the final graph.
 ///
 /// # Errors
 /// Propagates [`resolve_features`]'s worklist errors.  The empty

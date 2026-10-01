@@ -13,6 +13,7 @@ use pubgrub::{DefaultStringReporter, DerivationTree, Ranges, Reporter};
 use semver::Version;
 
 use crate::error::ResolveError;
+use crate::provider::SolverPackage;
 
 /// Build a [`ResolveError::Conflict`] from `PubGrub`'s
 /// `NoSolution` derivation tree.
@@ -22,7 +23,7 @@ use crate::error::ResolveError;
 /// through [`DefaultStringReporter`] and normalized so the
 /// resulting message is byte-stable across runs.
 pub(crate) fn explain_no_solution(
-    mut tree: DerivationTree<PackageName, Ranges<Version>, String>,
+    mut tree: DerivationTree<SolverPackage, Ranges<Version>, String>,
     root_name: &PackageName,
 ) -> ResolveError {
     tree.collapse_no_versions();
@@ -38,11 +39,12 @@ pub(crate) fn explain_no_solution(
 /// alphabetically-first non-root package mentioned, or falls
 /// back to the root name when only the root appears.
 fn pick_conflict_package(
-    tree: &DerivationTree<PackageName, Ranges<Version>, String>,
+    tree: &DerivationTree<SolverPackage, Ranges<Version>, String>,
     root: &PackageName,
 ) -> String {
     tree.packages()
         .into_iter()
+        .filter_map(SolverPackage::name)
         .filter(|p| *p != root)
         .min()
         .map_or_else(|| root.as_str().to_owned(), |p| p.as_str().to_owned())

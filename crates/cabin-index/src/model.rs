@@ -67,10 +67,8 @@ pub struct VersionMetadata {
     /// without further resolution.
     pub source: Option<SourceLocation>,
     /// Declared `[features]`, preserved as-is from the registry.
-    /// `None` for older entries that omit the field.  The resolver
-    /// does not currently consume features beyond passing them
-    /// through; the feature resolver consumes them in a later
-    /// step.
+    /// `None` for older entries that omit the field. The version resolver
+    /// consumes the typed view returned by [`Self::declared_features`].
     pub features: Option<serde_json::Value>,
     /// Declared `[profile.*]` tables, preserved as-is.  Profiles
     /// are local build configuration; the resolver never
@@ -141,6 +139,21 @@ pub struct RevisionMetadata {
     pub source: SourceLocation,
 }
 
+impl VersionMetadata {
+    /// Typed feature declarations, with an empty table for older entries.
+    ///
+    /// # Errors
+    /// Returns the deserialization error when the preserved feature metadata
+    /// does not have the package feature-table shape.
+    pub fn declared_features(&self) -> Result<cabin_core::Features, serde_json::Error> {
+        self.features
+            .clone()
+            .map(serde_json::from_value)
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+}
+
 /// One `system = true` dependency entry as it appears in an index
 /// version metadata document.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,23 +193,23 @@ pub struct IndexPackageDependency {
 }
 
 impl IndexPackageDependency {
-    /// Whether this edge participates in resolution on `platform`:
-    /// non-optional and, when `target`-conditioned, matching the
-    /// platform.  The single source of truth the resolver and the
-    /// sparse-HTTP prefetch both consult so they agree on which
-    /// edges reach the index.
+    /// Whether this edge is mandatory on `platform`. Optional edges also
+    /// participate in resolution when enabled by a feature.
     pub fn is_active_for(&self, platform: &cabin_core::TargetPlatform) -> bool {
+        !self.optional && self.matches_platform(platform)
+    }
+
+    /// Whether the edge is available on this platform, independently of features.
+    pub fn matches_platform(&self, platform: &cabin_core::TargetPlatform) -> bool {
         // Index dependency gating is platform-only; feature
         // conditions are never present on registry index metadata,
         // and compiler-conditioned entries are rejected by the
         // loader (`cabin publish` cannot produce them and
         // hand-authored ones refuse to load), so the platform-only
         // context is correct.
-        !self.optional
-            && self
-                .condition
-                .as_ref()
-                .is_none_or(|c| c.evaluate(&cabin_core::ConditionContext::platform_only(platform)))
+        self.condition
+            .as_ref()
+            .is_none_or(|c| c.evaluate(&cabin_core::ConditionContext::platform_only(platform)))
     }
 }
 

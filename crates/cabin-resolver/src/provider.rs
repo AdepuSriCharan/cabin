@@ -45,7 +45,8 @@ use std::ops::Bound;
 
 use cabin_core::standard_compatibility::{ConsumerStandards, edge_compatible};
 use cabin_core::{
-    IncompatibleStandards, PackageName, Requirement, StandardsMetadata, TargetPlatform,
+    FeatureEntry, Features, IncompatibleStandards, PackageName, Requirement, StandardsMetadata,
+    TargetPlatform,
 };
 use cabin_index::{IndexEntry, PackageIndex};
 use pubgrub::{
@@ -57,6 +58,46 @@ use crate::error::{ResolveError, ResolverConstraint};
 use crate::input::{LockedVersion, ResolveInput, ResolveMode};
 use crate::locked::{LockedConstraintRecorder, validate_locked_metadata};
 use crate::range::req_to_range;
+
+/// Feature nodes use the same version as their owner. `PubGrub` therefore
+/// withdraws their implications whenever it rejects that owner's version.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum SolverPackage {
+    Root,
+    Registry(PackageName),
+    Local(PackageName),
+    Feature(PackageName, String),
+    Optional(PackageName, PackageName),
+}
+
+impl SolverPackage {
+    pub(crate) fn name(&self) -> Option<&PackageName> {
+        match self {
+            Self::Root => None,
+            Self::Registry(name)
+            | Self::Local(name)
+            | Self::Feature(name, _)
+            | Self::Optional(name, _) => Some(name),
+        }
+    }
+}
+
+impl std::fmt::Display for SolverPackage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Root => f.write_str("workspace"),
+            Self::Registry(name) | Self::Local(name) => name.fmt(f),
+            Self::Feature(name, feature) => write!(f, "{name} feature {feature:?}"),
+            Self::Optional(name, dep) => write!(f, "{name} dependency {dep}"),
+        }
+    }
+}
+
+struct FeatureMetadata<'a> {
+    edges: Vec<(&'a PackageName, &'a cabin_index::IndexPackageDependency)>,
+    features: Features,
+    local: bool,
+}
 
 /// The three preference tiers of
 /// `docs/design/standard-compatibility/preference-mode.md` section 1,
@@ -85,7 +126,7 @@ enum StandardTier {
 /// it (see [`crate::locked`]).
 pub(crate) struct Provider<'a> {
     index: &'a PackageIndex,
-    root_name: PackageName,
+    input: &'a ResolveInput,
     root_version: Version,
     root_dependencies: Vec<(PackageName, Ranges<Version>)>,
     locked: BTreeMap<PackageName, LockedVersion>,
@@ -102,7 +143,7 @@ pub(crate) struct Provider<'a> {
 
 impl<'a> Provider<'a> {
     pub(crate) fn new(
-        input: &ResolveInput,
+        input: &'a ResolveInput,
         index: &'a PackageIndex,
         locked: BTreeMap<PackageName, LockedVersion>,
         platform: TargetPlatform,
@@ -116,7 +157,7 @@ impl<'a> Provider<'a> {
             .then(|| LockedConstraintRecorder::new(root_constraints));
         Self {
             index,
-            root_name: input.root_name.clone(),
+            input,
             root_version: input.root_version.clone(),
             root_dependencies,
             locked,
@@ -126,14 +167,10 @@ impl<'a> Provider<'a> {
             consumer_standards: input.consumer_standards,
         }
     }
-
-    fn is_root(&self, package: &PackageName) -> bool {
-        package == &self.root_name
-    }
 }
 
 impl DependencyProvider for Provider<'_> {
-    type P = PackageName;
+    type P = SolverPackage;
     type V = Version;
     type VS = Ranges<Version>;
     type M = String;
@@ -145,12 +182,29 @@ impl DependencyProvider for Provider<'_> {
         package: &Self::P,
         range: &Self::VS,
     ) -> Result<Option<Self::V>, Self::Err> {
-        if self.is_root(package) {
+        if matches!(package, SolverPackage::Root) {
             return Ok(if range.contains(&self.root_version) {
                 Some(self.root_version.clone())
             } else {
                 None
             });
+        }
+
+        let name = package.name().expect("non-root package");
+        if !matches!(package, SolverPackage::Registry(_))
+            && let Some(local) = self.input.local_feature_packages.get(name)
+        {
+            return Ok(range
+                .contains(&local.version)
+                .then(|| local.version.clone()));
+        }
+        let feature_node = !matches!(package, SolverPackage::Registry(_));
+        let package = name;
+        if self.input.sparse
+            && !self.index.packages.contains_key(package)
+            && !self.input.unavailable.contains(package)
+        {
+            return Err(ResolveError::IndexEntryRequired(package.clone()));
         }
 
         // A transitive package missing from the index is a
@@ -168,7 +222,7 @@ impl DependencyProvider for Provider<'_> {
             return self.choose_locked_candidate(package, recorder, entry, range);
         }
 
-        Ok(self.choose_compatible_candidate(package, entry, range))
+        Ok(self.choose_compatible_candidate(package, entry, range, feature_node))
     }
 
     fn prioritize(
@@ -177,9 +231,15 @@ impl DependencyProvider for Provider<'_> {
         range: &Self::VS,
         package_conflicts_counts: &PackageResolutionStatistics,
     ) -> Self::Priority {
-        let count = if self.is_root(package) {
+        let count = if matches!(package, SolverPackage::Root) {
             usize::from(range.contains(&self.root_version))
-        } else if let Some(entry) = self.index.package(package) {
+        } else if !matches!(package, SolverPackage::Registry(_))
+            && let Some(local) = package
+                .name()
+                .and_then(|name| self.input.local_feature_packages.get(name))
+        {
+            usize::from(range.contains(&local.version))
+        } else if let Some(entry) = package.name().and_then(|name| self.index.package(name)) {
             entry.versions.keys().filter(|v| range.contains(v)).count()
         } else {
             0
@@ -195,60 +255,254 @@ impl DependencyProvider for Provider<'_> {
         package: &Self::P,
         version: &Self::V,
     ) -> Result<Dependencies<Self::P, Self::VS, Self::M>, Self::Err> {
-        if self.is_root(package) {
-            return Ok(Dependencies::Available(
-                self.root_dependencies.iter().cloned().collect(),
-            ));
-        }
-
-        let entry = self
-            .index
-            .package(package)
-            .ok_or_else(|| ResolveError::UnknownPackage(package.as_str().to_owned()))?;
-        let Some(meta) = entry.versions.get(version) else {
-            return Ok(Dependencies::Unavailable(format!(
-                "{package} {version} is not present in the index"
-            )));
-        };
-
-        let mut deps: Vec<(PackageName, Ranges<Version>)> = Vec::new();
-        for (dep_name, dep_entry) in &meta.dependencies {
-            // Skip edges that do not participate in resolution on
-            // this host: optional deps (until a feature enables them,
-            // matching cabin-workspace::patch's conservative default)
-            // and `cfg(...)`-gated deps whose predicate fails here.
-            if !dep_entry.is_active_for(&self.platform) {
-                continue;
-            }
-            if let Some(recorder) = &self.locked_constraints {
-                recorder.record(dep_name, package.clone(), dep_entry.req.clone());
-            }
-            // An unsupported requirement syntax on a transitive
-            // dep is a backtrackable miss, not a fatal error:
-            // an older version of `package` may declare the
-            // same dep with a syntax this build understands, and
-            // returning `Err` here would abort resolution before
-            // `PubGrub` could try that alternative.  The root
-            // path catches unsupported syntax up front, where
-            // the error names the user-authored requirement.
-            let range = match req_to_range(&dep_entry.req) {
-                Ok(range) => range,
-                Err(err) => {
-                    return Ok(Dependencies::Unavailable(format!(
-                        "{package} {version} declares an unsupported version requirement for {dep_name}: {}",
-                        err.requirement,
-                    )));
-                }
-            };
-            deps.push((dep_name.clone(), range));
-        }
-        Ok(Dependencies::Available(DependencyConstraints::from_iter(
-            deps,
-        )))
+        Ok(self.feature_dependencies(package, version))
     }
 }
 
 impl Provider<'_> {
+    fn owner(&self, name: &PackageName) -> SolverPackage {
+        if self.input.local_feature_packages.contains_key(name) {
+            SolverPackage::Local(name.clone())
+        } else {
+            SolverPackage::Registry(name.clone())
+        }
+    }
+
+    fn add_edge(
+        &self,
+        deps: &mut BTreeMap<SolverPackage, Ranges<Version>>,
+        parent: &PackageName,
+        name: &PackageName,
+        edge: &cabin_index::IndexPackageDependency,
+        local: bool,
+    ) -> Result<(), crate::range::RangeConversionError> {
+        let target = if local {
+            self.owner(name)
+        } else {
+            SolverPackage::Registry(name.clone())
+        };
+        let range = if matches!(target, SolverPackage::Local(_)) {
+            let path_edge = self
+                .input
+                .local_feature_packages
+                .get(parent)
+                .is_some_and(|package| package.path_dependencies.contains(name));
+            let replacement = &self.input.local_feature_packages[name];
+            if path_edge || edge.req.matches(&replacement.version) {
+                Ranges::singleton(replacement.version.clone())
+            } else {
+                Ranges::empty()
+            }
+        } else {
+            if let Some(recorder) = &self.locked_constraints {
+                recorder.record(name, parent.clone(), edge.req.clone());
+            }
+            req_to_range(&edge.req)?
+        };
+        insert_constraint(deps, target, range);
+        if edge.default_features {
+            insert_constraint(
+                deps,
+                SolverPackage::Feature(name.clone(), "default".to_owned()),
+                Ranges::full(),
+            );
+        }
+        for feature in &edge.features {
+            insert_constraint(
+                deps,
+                SolverPackage::Feature(name.clone(), feature.clone()),
+                Ranges::full(),
+            );
+        }
+        Ok(())
+    }
+
+    fn root_feature_dependencies(&self) -> BTreeMap<SolverPackage, Ranges<Version>> {
+        let mut deps = BTreeMap::new();
+        for (name, range) in &self.root_dependencies {
+            insert_constraint(
+                &mut deps,
+                SolverPackage::Registry(name.clone()),
+                range.clone(),
+            );
+            if self.input.local_feature_roots.is_empty() {
+                insert_constraint(
+                    &mut deps,
+                    SolverPackage::Feature(name.clone(), "default".to_owned()),
+                    Ranges::full(),
+                );
+            }
+        }
+        for (name, features) in &self.input.local_feature_roots {
+            insert_constraint(
+                &mut deps,
+                SolverPackage::Local(name.clone()),
+                Ranges::full(),
+            );
+            for feature in features {
+                insert_constraint(
+                    &mut deps,
+                    SolverPackage::Feature(name.clone(), feature.clone()),
+                    Ranges::full(),
+                );
+            }
+        }
+        deps
+    }
+
+    fn feature_metadata(
+        &self,
+        name: &PackageName,
+        version: &Version,
+    ) -> Result<FeatureMetadata<'_>, String> {
+        if let Some(local) = self.input.local_feature_packages.get(name) {
+            return Ok(FeatureMetadata {
+                edges: local
+                    .dependencies
+                    .iter()
+                    .map(|(name, edge)| (name, edge))
+                    .collect(),
+                features: local.features.clone(),
+                local: true,
+            });
+        }
+        let meta = self
+            .index
+            .package(name)
+            .and_then(|entry| entry.versions.get(version))
+            .ok_or_else(|| format!("{name} {version} is not present in the index"))?;
+        let features = meta
+            .declared_features()
+            .map_err(|error| format!("invalid features for {name} {version}: {error}"))?;
+        Ok(FeatureMetadata {
+            edges: meta.dependencies.iter().collect(),
+            features,
+            local: false,
+        })
+    }
+
+    fn feature_dependencies(
+        &self,
+        package: &SolverPackage,
+        version: &Version,
+    ) -> Dependencies<SolverPackage, Ranges<Version>, String> {
+        if matches!(package, SolverPackage::Root) {
+            return Dependencies::Available(DependencyConstraints::from_iter(
+                self.root_feature_dependencies(),
+            ));
+        }
+        let name = package.name().expect("non-root package");
+        let mut deps = BTreeMap::new();
+        // The registry identity still carries the incoming version requirement;
+        // its replacement supplies all feature definitions and outgoing edges.
+        if matches!(package, SolverPackage::Registry(_))
+            && self.input.local_feature_packages.contains_key(name)
+        {
+            insert_constraint(
+                &mut deps,
+                SolverPackage::Local(name.clone()),
+                Ranges::full(),
+            );
+            return Dependencies::Available(DependencyConstraints::from_iter(deps));
+        }
+        let metadata = match self.feature_metadata(name, version) {
+            Ok(metadata) => metadata,
+            Err(error) => return Dependencies::Unavailable(error),
+        };
+        if matches!(
+            package,
+            SolverPackage::Feature(..) | SolverPackage::Optional(..)
+        ) {
+            insert_constraint(
+                &mut deps,
+                self.owner(name),
+                Ranges::singleton(version.clone()),
+            );
+        }
+        if let SolverPackage::Feature(_, feature) = package {
+            if let Err(error) =
+                self.feature_implications(&mut deps, name, version, feature, &metadata)
+            {
+                return Dependencies::Unavailable(error);
+            }
+        } else {
+            for (dep_name, edge) in &metadata.edges {
+                let include = match package {
+                    SolverPackage::Optional(_, dependency) => *dep_name == dependency,
+                    _ => !edge.optional,
+                };
+                if !include || !edge.matches_platform(&self.platform) {
+                    continue;
+                }
+                if let Err(error) = self.add_edge(&mut deps, name, dep_name, edge, metadata.local) {
+                    return Dependencies::Unavailable(format!(
+                        "{name} {version} declares an unsupported version requirement for {dep_name}: {}",
+                        error.requirement
+                    ));
+                }
+            }
+        }
+        Dependencies::Available(DependencyConstraints::from_iter(deps))
+    }
+
+    fn feature_implications(
+        &self,
+        deps: &mut BTreeMap<SolverPackage, Ranges<Version>>,
+        name: &PackageName,
+        version: &Version,
+        feature: &str,
+        metadata: &FeatureMetadata<'_>,
+    ) -> Result<(), String> {
+        let entries = if feature == "default" {
+            &metadata.features.default
+        } else {
+            // Diagnose unknown requested features from the chosen manifest during
+            // build rather than silently selecting another release here.
+            metadata
+                .features
+                .features
+                .get(feature)
+                .map_or(&[][..], Vec::as_slice)
+        };
+        for raw in entries {
+            let entry = FeatureEntry::parse(raw)
+                .map_err(|error| format!("invalid feature entry {raw:?} in {name}: {error:?}"))?;
+            let (dependency, requested_feature) = match entry {
+                FeatureEntry::Local(feature) => {
+                    insert_constraint(
+                        deps,
+                        SolverPackage::Feature(name.clone(), feature),
+                        Ranges::singleton(version.clone()),
+                    );
+                    continue;
+                }
+                FeatureEntry::OptionalDep(dep) => (dep, None),
+                FeatureEntry::DepFeature { dep, feature } => (dep, Some(feature)),
+            };
+            for (dep_name, edge) in &metadata.edges {
+                if dep_name.as_str() != dependency
+                    || !edge.matches_platform(&self.platform)
+                    || (requested_feature.is_none() && !edge.optional)
+                {
+                    continue;
+                }
+                insert_constraint(
+                    deps,
+                    SolverPackage::Optional(name.clone(), (*dep_name).clone()),
+                    Ranges::singleton(version.clone()),
+                );
+                if let Some(feature) = &requested_feature {
+                    insert_constraint(
+                        deps,
+                        SolverPackage::Feature((*dep_name).clone(), feature.clone()),
+                        Ranges::full(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Pick a version of `entry` inside `range`, preferring the
     /// lockfile entry when it qualifies and otherwise applying the
     /// standard-preference ordering of
@@ -269,6 +523,7 @@ impl Provider<'_> {
         package: &PackageName,
         entry: &IndexEntry,
         range: &Ranges<Version>,
+        feature_node: bool,
     ) -> Option<Version> {
         let mut candidates: Vec<&Version> = entry
             .versions
@@ -280,7 +535,9 @@ impl Provider<'_> {
             return None;
         }
 
-        candidates.retain(|v| candidate_admits_prerelease(range, v));
+        if !feature_node {
+            candidates.retain(|v| candidate_admits_prerelease(range, v));
+        }
         if candidates.is_empty() {
             return None;
         }
@@ -363,6 +620,16 @@ impl Provider<'_> {
         }
         Ok(Some(locked.version.clone()))
     }
+}
+
+fn insert_constraint(
+    deps: &mut BTreeMap<SolverPackage, Ranges<Version>>,
+    package: SolverPackage,
+    range: Ranges<Version>,
+) {
+    deps.entry(package)
+        .and_modify(|existing| *existing = existing.intersection(&range))
+        .or_insert(range);
 }
 
 /// Classify a candidate version's declared standards into its

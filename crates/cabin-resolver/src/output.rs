@@ -1,8 +1,10 @@
 use cabin_core::{PackageName, SourceLanguage};
 use pubgrub::SelectedDependencies;
 use semver::Version;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::input::ResolveInput;
+use crate::provider::SolverPackage;
 
 /// Resolution result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +19,10 @@ pub struct ResolveOutput {
     /// (ordinary semver hold-backs are never reported).  Sorted by
     /// package name.
     pub held_back: Vec<HeldBack>,
+    /// Feature requests of the selected versions, including local replacements.
+    pub features: BTreeMap<PackageName, BTreeSet<String>>,
+    /// Dependencies activated by feature entries on the selected versions.
+    pub enabled_optional_dependencies: BTreeMap<PackageName, BTreeSet<PackageName>>,
 }
 
 /// A standard-compatibility note about a resolved package.  Three
@@ -152,15 +158,40 @@ impl ResolvedSource {
 /// values.
 pub(crate) fn selected_dependencies_to_output(
     input: &ResolveInput,
-    solution: SelectedDependencies<PackageName, Version>,
+    solution: SelectedDependencies<SolverPackage, Version>,
 ) -> ResolveOutput {
+    let mut features: BTreeMap<PackageName, BTreeSet<String>> = BTreeMap::new();
+    let mut enabled_optional_dependencies: BTreeMap<PackageName, BTreeSet<PackageName>> =
+        BTreeMap::new();
+    for (node, _) in solution.iter() {
+        match node {
+            SolverPackage::Feature(name, feature) => {
+                features
+                    .entry(name.clone())
+                    .or_default()
+                    .insert(feature.clone());
+            }
+            SolverPackage::Local(name) => {
+                features.entry(name.clone()).or_default();
+            }
+            SolverPackage::Optional(name, dep) => {
+                enabled_optional_dependencies
+                    .entry(name.clone())
+                    .or_default()
+                    .insert(dep.clone());
+            }
+            _ => {}
+        }
+    }
     let mut others: Vec<ResolvedPackage> = solution
         .into_iter()
-        .filter(|(name, _)| name != &input.root_name)
-        .map(|(name, version)| ResolvedPackage {
-            name,
-            version,
-            source: ResolvedSource::Index,
+        .filter_map(|(node, version)| match node {
+            SolverPackage::Registry(name) => Some(ResolvedPackage {
+                name,
+                version,
+                source: ResolvedSource::Index,
+            }),
+            _ => None,
         })
         .collect();
     others.sort_by(|a, b| a.name.cmp(&b.name).then(a.version.cmp(&b.version)));
@@ -175,5 +206,7 @@ pub(crate) fn selected_dependencies_to_output(
     ResolveOutput {
         packages,
         held_back: Vec::new(),
+        features,
+        enabled_optional_dependencies,
     }
 }

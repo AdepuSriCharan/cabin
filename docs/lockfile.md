@@ -206,6 +206,10 @@ populated - already-cached and already-extracted artifacts may still be reused, 
 
 Re-resolves everything, ignoring the locked map.  Writes the new lockfile.
 
+Use `--features`, `--all-features`, and `--no-default-features` to select the same feature closure
+as `cabin build` or `cabin resolve`. Enabled optional registry dependencies enter the lockfile;
+disabling the features that alone enable them removes them on the next resolution.
+
 ### `cabin update --package <name>`
 
 Drops one entry from the locked map and re-resolves with the rest still preferred.  Useful for

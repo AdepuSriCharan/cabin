@@ -1088,6 +1088,18 @@ pub(crate) struct UpdateArgs {
     #[command(flatten)]
     pub workspace_selection: WorkspaceSelectionArgsForUpdate,
 
+    /// Enable named features for the selected packages.
+    #[arg(long, value_name = "FEATURES")]
+    pub features: Vec<String>,
+
+    /// Enable every declared feature on selected packages.
+    #[arg(long)]
+    pub all_features: bool,
+
+    /// Disable each selected package's default features.
+    #[arg(long)]
+    pub no_default_features: bool,
+
     /// Disable every active patch and source-replacement entry
     /// for this invocation.  See `docs/patch-overrides.md`.
     #[arg(long)]

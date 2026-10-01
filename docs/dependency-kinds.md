@@ -181,9 +181,9 @@ manifest layer reports the violation as `OptionalNotSupportedForKind` (dev) or `
 
 ## Scope
 
-- **Registry optional-dep activation is conservative.** Optional dependencies declared by registry
-  packages are preserved in metadata; the resolver activates them only from feature state visible on
-  local (workspace / path) packages.
+- **Registry optional dependencies follow features.** Active incoming edges combine default and
+  named feature requests. Their implications activate optional dependencies and add their version
+  requirements to resolution. Platform-inactive edges contribute neither dependencies nor features.
 - **System deps are primary-only and pkg-config-only.** Cabin invokes pkg-config for active `system
   = true` entries declared by selected primary packages.  It does not probe system declarations from
   local path or registry dependencies and does not invoke any other system package manager.

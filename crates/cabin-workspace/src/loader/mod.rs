@@ -770,6 +770,11 @@ fn resolve_dep_manifest_path(
             if let Some(path) = ctx.registry.by_name.get(dep.name.as_str()) {
                 path.clone()
             } else {
+                // Disabled optional packages are deliberately not materialized.
+                // Feature resolution and target planning diagnose requests for them.
+                if dep.optional {
+                    return Ok(None);
+                }
                 // a missing registry entry is
                 // only an error when the *parent*
                 // package is one the caller flagged as

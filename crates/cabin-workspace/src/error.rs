@@ -9,6 +9,9 @@ use thiserror::Error;
 /// transitive local path dependencies.
 #[derive(Debug, Error, Diagnostic)]
 pub enum WorkspaceError {
+    #[error(transparent)]
+    PatchValidation(#[from] cabin_core::PatchValidationError),
+
     /// No `cabin.toml` was found at the requested path.  Distinct
     /// from [`WorkspaceError::Io`] so the diagnostic layer can
     /// emit a single, deduplicated `manifest_not_found` report

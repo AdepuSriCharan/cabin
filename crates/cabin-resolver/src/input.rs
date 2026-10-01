@@ -53,6 +53,14 @@ pub struct ResolveInput {
     /// so a patched-away upstream cannot report a collision the
     /// final link can never have.
     pub locally_supplied: BTreeSet<PackageName>,
+    /// Feature metadata for packages supplied by the caller rather than the index.
+    pub local_feature_packages: BTreeMap<PackageName, LocalFeaturePackage>,
+    /// Included local packages and their initial feature requests.
+    pub local_feature_roots: BTreeMap<PackageName, BTreeSet<String>>,
+    /// Request missing index entries from the caller during sparse resolution.
+    pub sparse: bool,
+    /// Names already confirmed absent from the sparse index.
+    pub unavailable: BTreeSet<PackageName>,
 }
 
 impl ResolveInput {
@@ -73,8 +81,24 @@ impl ResolveInput {
             consumer_standards: ConsumerStandards { c: None, cxx: None },
             local_links: Vec::new(),
             locally_supplied: BTreeSet::new(),
+            local_feature_packages: BTreeMap::new(),
+            local_feature_roots: BTreeMap::new(),
+            sparse: false,
+            unavailable: BTreeSet::new(),
         }
     }
+}
+
+/// Caller-supplied feature metadata, without paths or manifest state.
+#[derive(Debug, Clone)]
+pub struct LocalFeaturePackage {
+    pub version: semver::Version,
+    pub features: cabin_core::Features,
+    pub links: Vec<LinksClaim>,
+    pub dependencies: Vec<(PackageName, cabin_index::IndexPackageDependency)>,
+    /// Local path edges have no version requirement; versioned edges onto
+    /// local replacements must still accept the replacement's version.
+    pub path_dependencies: BTreeSet<PackageName>,
 }
 
 /// One target's declared native-library identity claim, attributed

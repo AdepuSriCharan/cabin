@@ -340,6 +340,8 @@ where
 /// when the requirements collected for a single dependency name
 /// cannot be combined into one [`semver::VersionReq`] (the joined
 /// requirement string fails to parse).
+/// Returns [`WorkspaceError::PatchValidation`] when an active versioned edge
+/// rejects its local replacement's version.
 pub fn collect_closure_versioned_deps_excluding_with_dev<F>(
     graph: &PackageGraph,
     closure: &BTreeSet<usize>,
@@ -378,6 +380,21 @@ where
                 &is_optional_dep_enabled,
             ) {
                 if excluded_names.contains(dep.name.as_str()) {
+                    if let Some(edge) = pkg
+                        .deps
+                        .iter()
+                        .find(|edge| graph.packages[edge.index].package.name == dep.name)
+                    {
+                        let replacement = &graph.packages[edge.index].package;
+                        if !req.matches(&replacement.version) {
+                            return Err(cabin_core::PatchValidationError::VersionMismatch {
+                                package: dep.name.as_str().to_owned(),
+                                version: replacement.version.to_string(),
+                                requirement: req.to_string(),
+                            }
+                            .into());
+                        }
+                    }
                     referenced_excluded.insert(dep.name.as_str().to_owned());
                     continue;
                 }

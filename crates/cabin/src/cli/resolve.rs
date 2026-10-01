@@ -101,6 +101,7 @@ pub(crate) fn enforce_seed_links_uniqueness(
 pub(crate) struct PatchActivationContext<'a> {
     pub graph: &'a PackageGraph,
     pub features: &'a cabin_feature::FeatureResolution,
+    pub dev_for: &'a BTreeSet<String>,
     pub active_patches: &'a cabin_workspace::ActivePatchSet,
     pub patched_names: &'a BTreeSet<String>,
     /// Closure-collected versioned deps, patched names excluded.
@@ -140,6 +141,56 @@ pub(crate) fn resolve_with_patch_activation(
     ctx: &PatchActivationContext<'_>,
     lean: bool,
 ) -> Result<(ResolveOutput, BTreeSet<String>)> {
+    input.sparse = sparse.is_some();
+    for (idx, pkg) in ctx.graph.packages.iter().enumerate() {
+        let dependencies = pkg
+            .package
+            .dependencies
+            .iter()
+            .filter(|dep| {
+                dep.kind.is_resolved_by_default()
+                    || (dep.kind == cabin_core::DependencyKind::Dev
+                        && ctx.dev_for.contains(pkg.package.name.as_str()))
+            })
+            .map(|dep| {
+                (
+                    dep.name.clone(),
+                    cabin_index::IndexPackageDependency {
+                        req: match &dep.source {
+                            cabin_core::DependencySource::Version(req) => req.clone(),
+                            _ => semver::VersionReq::STAR,
+                        },
+                        optional: dep.optional,
+                        features: dep.features.clone(),
+                        default_features: dep.default_features,
+                        condition: dep.condition.clone(),
+                    },
+                )
+            })
+            .collect();
+        input.local_feature_packages.insert(
+            pkg.package.name.clone(),
+            cabin_resolver::LocalFeaturePackage {
+                version: pkg.package.version.clone(),
+                features: pkg.package.features.clone(),
+                dependencies,
+                links: links_claims_of(ctx.graph, &BTreeSet::from([idx])),
+                path_dependencies: pkg
+                    .package
+                    .dependencies
+                    .iter()
+                    .filter(|dep| matches!(dep.source, cabin_core::DependencySource::Path(_)))
+                    .map(|dep| dep.name.clone())
+                    .collect(),
+            },
+        );
+        if ctx.features.included.contains(&idx) {
+            input.local_feature_roots.insert(
+                pkg.package.name.clone(),
+                ctx.features.for_package(idx).enabled_features.clone(),
+            );
+        }
+    }
     let included_names: BTreeSet<PackageName> = ctx
         .features
         .included
@@ -220,11 +271,11 @@ pub(crate) fn resolve_with_patch_activation(
                 .cloned()
                 .collect();
             if !missing.is_empty() {
-                let extra = http
-                    .load_package_index(&missing)
-                    .context("failed to extend the sparse index with patched dependencies")?;
-                for (name, entry) in extra.packages {
-                    index.packages.entry(name).or_insert(entry);
+                for name in missing {
+                    let entry = http
+                        .fetch_package(&name)
+                        .context("failed to extend the sparse index with patched dependencies")?;
+                    index.packages.insert(name, entry);
                 }
             }
         }
@@ -245,8 +296,13 @@ pub(crate) fn resolve_with_patch_activation(
                 .iter()
                 .any(|name| !activated.contains(name))
         {
-            let probe = cabin_resolver::resolve_packages_unchecked(input, index)
-                .context("dependency resolution failed")?;
+            let probe = resolve_sparse(
+                input,
+                index,
+                sparse,
+                cabin_resolver::resolve_packages_unchecked,
+            )
+            .context("dependency resolution failed")?;
             // Activation follows the same live boundary as claims: a
             // patched name selected only behind a locally-supplied
             // (or patched) selection's dead upstream edges never
@@ -269,6 +325,15 @@ pub(crate) fn resolve_with_patch_activation(
                 })
                 .map(|package| package.name.as_str().to_owned())
                 .filter(|name| ctx.patched_names.contains(name) && !activated.contains(name))
+                .chain(
+                    probe
+                        .features
+                        .keys()
+                        .map(|name| name.as_str().to_owned())
+                        .filter(|name| {
+                            ctx.patched_names.contains(name) && !activated.contains(name)
+                        }),
+                )
                 .collect();
             if !discovered.is_empty() {
                 activated.extend(discovered);
@@ -311,6 +376,13 @@ pub(crate) fn resolve_with_patch_activation(
             // `kept`, bounded by the patch count).
             if solution_discovered {
                 let mut kept = ctx.closure_referenced.clone();
+                kept.extend(
+                    probe
+                        .features
+                        .keys()
+                        .map(|name| name.as_str().to_owned())
+                        .filter(|name| ctx.patched_names.contains(name)),
+                );
                 let roots = loop {
                     let refolded = collect_patched_versioned_deps(
                         ctx.active_patches,
@@ -367,14 +439,46 @@ pub(crate) fn resolve_with_patch_activation(
                 }
             }
         }
-        let output = if lean {
-            cabin_resolver::resolve_packages(input, index)
+        let solve = if lean {
+            cabin_resolver::resolve_packages
         } else {
-            cabin_resolver::resolve(input, index)
-        }
-        .context("dependency resolution failed")?;
+            cabin_resolver::resolve
+        };
+        let output =
+            resolve_sparse(input, index, sparse, solve).context("dependency resolution failed")?;
         enforce_activated_fork_versions(&output, index, ctx, &activated, &input.locally_supplied)?;
         return Ok((output, activated));
+    }
+}
+
+/// Fetch only metadata the solver actually asks for. A transitive 404 is
+/// recorded as an absent candidate so `PubGrub` can try another parent version.
+fn resolve_sparse(
+    input: &mut ResolveInput,
+    index: &mut PackageIndex,
+    sparse: Option<&cabin_index_http::HttpIndex>,
+    solve: fn(
+        &ResolveInput,
+        &PackageIndex,
+    ) -> std::result::Result<ResolveOutput, cabin_resolver::ResolveError>,
+) -> Result<ResolveOutput> {
+    loop {
+        let result = solve(input, index);
+        match result {
+            Err(cabin_resolver::ResolveError::IndexEntryRequired(name)) => {
+                let http = sparse.expect("only sparse resolution requests index entries");
+                match http.fetch_package(&name) {
+                    Ok(entry) => {
+                        index.packages.insert(name, entry);
+                    }
+                    Err(cabin_index_http::IndexHttpError::PackageNotFound { .. }) => {
+                        input.unavailable.insert(name);
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            other => return other.map_err(anyhow::Error::from),
+        }
     }
 }
 
@@ -421,6 +525,7 @@ fn enforce_activated_fork_versions(
         &fork_versions,
         &roots,
         locally_supplied,
+        &output.enabled_optional_dependencies,
     )?;
     Ok(())
 }
@@ -549,7 +654,11 @@ pub(super) fn update(args: &UpdateArgs, reporter: Reporter) -> Result<()> {
             format: args.format,
             policy,
             selection: workspace_selection,
-            selection_request: cabin_core::SelectionRequest::default(),
+            selection_request: build_selection_request(
+                &args.features,
+                args.all_features,
+                args.no_default_features,
+            ),
             no_patches: args.no_patches,
             offline: args.offline,
         },
@@ -880,10 +989,8 @@ fn run_resolution(request: &ResolutionRequest<'_>, reporter: Reporter) -> Result
     }
 
     if root_deps.is_empty() {
-        // No versioned deps to resolve.  Print a clear empty result
-        // and never touch the lockfile.  The patch-staleness check
-        // above already ran, so `--locked` will already have bailed
-        // if the patch set diverged from the lockfile's record.
+        // Clear a previous resolution when the last optional edge was disabled.
+        // A package that has never needed a lockfile still needs none.
         let output = ResolveOutput {
             packages: vec![ResolvedPackage {
                 name: root_name,
@@ -891,7 +998,17 @@ fn run_resolution(request: &ResolutionRequest<'_>, reporter: Reporter) -> Result
                 source: ResolvedSource::Root,
             }],
             held_back: Vec::new(),
+            features: BTreeMap::new(),
+            enabled_optional_dependencies: BTreeMap::new(),
         };
+        if request.policy.allow_write() {
+            clear_resolution_lockfile(
+                request.manifest_path,
+                &active_patches,
+                &effective_config.source_replacements,
+                request.no_patches,
+            )?;
+        }
         emit_resolve_output(&output, request.format)?;
         return Ok(());
     }
@@ -978,6 +1095,7 @@ fn run_resolution(request: &ResolutionRequest<'_>, reporter: Reporter) -> Result
         &PatchActivationContext {
             graph: &graph,
             features: &features,
+            dev_for: &dev_for,
             active_patches: &active_patches,
             patched_names: &patched_names,
             base_root_deps: &base_root_deps,
@@ -1417,6 +1535,14 @@ pub(crate) fn run_artifact_pipeline(
     // Loading an index, walking the lockfile, and downloading
     // artifacts are all unnecessary in that case.
     if root_deps.is_empty() {
+        if request.policy.allow_write() {
+            clear_resolution_lockfile(
+                manifest_path,
+                request.active_patches,
+                request.source_replacements,
+                request.no_patches,
+            )?;
+        }
         return Ok(ArtifactPipeline {
             fetched: Vec::new(),
             lockfile_pinned: BTreeSet::new(),
@@ -1512,6 +1638,7 @@ pub(crate) fn run_artifact_pipeline(
         &PatchActivationContext {
             graph,
             features: &features,
+            dev_for: request.dev_for,
             active_patches: request.active_patches,
             patched_names: request.patched_names,
             base_root_deps: &base_root_deps,
@@ -1661,7 +1788,15 @@ pub(crate) fn load_http_index(
     }
     let http_index = cabin_index_http::HttpIndex::open(url, client.clone())?;
     let names: Vec<PackageName> = root_deps.keys().cloned().collect();
-    let index = http_index.load_package_index(&names)?;
+    let mut index = PackageIndex {
+        root: PathBuf::from(url),
+        packages: BTreeMap::new(),
+    };
+    for name in names {
+        index
+            .packages
+            .insert(name.clone(), http_index.fetch_package(&name)?);
+    }
     Ok((index, http_index, client))
 }
 
@@ -1808,6 +1943,27 @@ pub(crate) fn read_optional_lockfile(lockfile_path: &Path) -> Result<Option<Lock
     }
 }
 
+pub(crate) fn clear_resolution_lockfile(
+    manifest_path: &Path,
+    patches: &cabin_workspace::ActivePatchSet,
+    replacements: &cabin_core::SourceReplacementSettings,
+    no_patches: bool,
+) -> Result<()> {
+    let path = lockfile_path_for(manifest_path);
+    if let Some(mut lock) = read_optional_lockfile(&path)? {
+        let previous = lock.clone();
+        lock.packages.clear();
+        lock.patches = crate::cli::patch::lockfile_patches(patches);
+        lock.source_replacements =
+            crate::cli::patch::lockfile_source_replacements(replacements, no_patches);
+        if lock != previous {
+            cabin_lockfile::write_lockfile(&path, &lock)
+                .with_context(|| format!("failed to write {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
 fn lockfile_from_resolution(
     output: &ResolveOutput,
     index: &cabin_index::PackageIndex,
@@ -1839,9 +1995,24 @@ fn lockfile_from_resolution(
         // Filter to only dep names that are also resolved (defensive).
         let mut deps: Vec<PackageName> = meta
             .dependencies
-            .keys()
-            .filter(|n| resolved_names.contains(n.as_str()))
-            .cloned()
+            .iter()
+            .filter(|(name, edge)| {
+                if !resolved_names.contains(name.as_str()) {
+                    return false;
+                }
+                if edge.is_active_for(&cabin_core::TargetPlatform::current()) {
+                    return true;
+                }
+                if !edge.optional || !edge.matches_platform(&cabin_core::TargetPlatform::current())
+                {
+                    return false;
+                }
+                output
+                    .enabled_optional_dependencies
+                    .get(&pkg.name)
+                    .is_some_and(|enabled| enabled.contains(*name))
+            })
+            .map(|(name, _)| name.clone())
             .collect();
         deps.sort();
         // A previously pinned packaging revision is kept while it is

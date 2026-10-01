@@ -1249,22 +1249,17 @@ c-standard = "c11"
         packages.iter().all(|(name, _)| name != "bbb"),
         "nothing reaches the patched name after the flip: {packages:?}"
     );
-    // The injected fork dep stays resolved - withdrawing it would
-    // re-select aaa 2.0.0 and oscillate; the residue is an unused
-    // package, not a claim.
+    // Backtracking also withdraws the rejected fork's dependency.
     assert!(
-        packages.contains(&("ccc".to_owned(), "2.0.0".to_owned())),
-        "the injected fork dep remains in the solution: {packages:?}"
+        packages.iter().all(|(name, _)| name != "ccc"),
+        "the rejected fork's dependency must be absent: {packages:?}"
     );
 }
 
-/// The root deps injected for a pruned activation stay in the solve
-/// (withdrawing them oscillates), but the orphaned selections they
-/// pull in never link: their index claims must not collide with a
-/// live package's.  Reachable claimants keep colliding - the
-/// suppression is residue-only.
+/// Dependencies of a rejected patch activation disappear with their
+/// native identity claims. A live edge onto the same claimant still collides.
 #[test]
-fn pruned_activation_residue_claims_are_suppressed() {
+fn rejected_patch_dependencies_and_claims_are_removed() {
     let dir = TempDir::new().unwrap();
     let index = dir.path().join("index");
     // Same flip as the pruning test: aaa 2.0.0 reaches patched bbb
@@ -1371,8 +1366,7 @@ c-standard = "c11"
         .write_str("int main(void) { return 0; }\n")
         .unwrap();
 
-    // The orphaned ccc 2.0.0 is selected (residue) but never links,
-    // so its claim must not collide with zzz's.
+    // The rejected dependency's claim must not collide with zzz's.
     let value = run_json(
         cabin()
             .args(["resolve", "--manifest-path"])
@@ -1393,8 +1387,8 @@ c-standard = "c11"
         })
         .collect();
     assert!(
-        packages.contains(&("ccc".to_owned(), "2.0.0".to_owned())),
-        "the residue stays resolved: {packages:?}"
+        packages.iter().all(|(name, _)| name != "ccc"),
+        "the rejected dependency must be absent: {packages:?}"
     );
 
     // Sensitivity control: the same ccc 2.0.0 reached by a real root
@@ -1432,14 +1426,10 @@ c-standard = "c11"
     }
 }
 
-/// Residue can select a *patched* name: after the flip prunes bbb,
-/// the orphaned ccc 2.0.0 still back-edges onto patched ddd.  A
-/// fork reached only through residue never links, so ddd must stay
-/// dormant - keeping it activated would let its fork's claim
-/// falsely collide with zzz's.  Liveness is reachability, not
-/// probe membership.
+/// A patch reached solely through a rejected dependency stays dormant.
+/// Its native identity claim must not collide with a live package's claim.
 #[test]
-fn residue_reached_patch_stays_dormant() {
+fn patch_reached_through_rejected_dependency_stays_dormant() {
     let dir = TempDir::new().unwrap();
     let index = dir.path().join("index");
     assert_fs::fixture::ChildPath::new(index.join("aaa.json"))
@@ -1594,8 +1584,10 @@ c-standard = "c11"
         "nothing reaches the patched name after the flip: {packages:?}"
     );
     assert!(
-        packages.contains(&("ddd".to_owned(), "1.0.0".to_owned())),
-        "residue-reached ddd stays a plain index selection: {packages:?}"
+        packages
+            .iter()
+            .all(|(name, _)| name != "ccc" && name != "ddd"),
+        "the rejected dependency and its patch must be absent: {packages:?}"
     );
 }
 
@@ -1804,15 +1796,10 @@ fn fork_disabled_optional_path_dep_claims_do_not_participate() {
         .success();
 }
 
-/// A transitively-activated fork's *feature-enabled* optional path
-/// dependency is out of resolution's reach: the fork's real feature
-/// set is decided by its dependents' edges, which the resolution
-/// layer deliberately does not interpret, so resolve and update
-/// stay conservative (mandatory island claims only) and the
-/// collision defers to the building commands' final-graph check
-/// (`fork_default_enabled_optional_dep_collides_at_build`).
+/// Incoming registry defaults enable the fork's optional path dependency,
+/// so resolve and update both report its native identity collision.
 #[test]
-fn fork_default_enabled_optional_path_dep_defers_to_build() {
+fn fork_default_enabled_optional_path_dep_collides_at_resolve() {
     let dir = TempDir::new().unwrap();
     write_fork_optional_claim_fixture(dir.path(), true);
 
@@ -1823,7 +1810,8 @@ fn fork_default_enabled_optional_path_dep_defers_to_build() {
             .arg("--index-path")
             .arg(dir.path().join("index"))
             .assert()
-            .success();
+            .failure()
+            .stderr(predicate::str::contains(COLLISION_PHRASE));
     }
 }
 
@@ -1980,19 +1968,16 @@ fn resolve_with_index_assert(root: &Path, manifest: &Path) -> assert_cmd::assert
         .assert()
 }
 
-/// The build-level control for
-/// `fork_default_enabled_optional_path_dep_defers_to_build`: the
-/// final reload applies aaa's real edge request (a plain `>=1`
-/// keeps the fork's default features on), the enabled `withz`
-/// links `zlocal`, and the final-graph check refuses the collision
-/// with the registry claimant.
+/// Build also reports the collision from a fork's enabled optional path dependency.
 #[test]
 fn fork_default_enabled_optional_dep_collides_at_build() {
     require_c_and_cxx_build_tools();
     let dir = TempDir::new().unwrap();
     let manifest = write_fork_build_fixture(dir.path(), r#""acme/bbb" = ">=1""#, true);
 
-    resolve_with_index_assert(dir.path(), &manifest).success();
+    resolve_with_index_assert(dir.path(), &manifest)
+        .failure()
+        .stderr(predicate::str::contains(COLLISION_PHRASE));
     let output = build_assert(dir.path(), &manifest).failure();
     let stderr = String::from_utf8_lossy(&output.get_output().stderr);
     for needle in [COLLISION_PHRASE, "\"z\"", "zlocal", "acme/zzz"] {
@@ -2021,8 +2006,7 @@ fn fork_edge_default_features_off_builds_clean() {
 
 /// An explicitly-requested edge feature enables the claiming
 /// optional dependency even though the fork's own `default` never
-/// would: invisible to resolution's conservative pass, refused by
-/// the final-graph check.
+/// would. Resolve and build both report the collision.
 #[test]
 fn fork_edge_explicit_feature_collides_at_build() {
     require_c_and_cxx_build_tools();
@@ -2033,7 +2017,9 @@ fn fork_edge_explicit_feature_collides_at_build() {
         false,
     );
 
-    resolve_with_index_assert(dir.path(), &manifest).success();
+    resolve_with_index_assert(dir.path(), &manifest)
+        .failure()
+        .stderr(predicate::str::contains(COLLISION_PHRASE));
     let output = build_assert(dir.path(), &manifest).failure();
     let stderr = String::from_utf8_lossy(&output.get_output().stderr);
     for needle in [COLLISION_PHRASE, "\"z\"", "zlocal", "acme/zzz"] {

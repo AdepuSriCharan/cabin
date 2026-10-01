@@ -13,6 +13,10 @@ use thiserror::Error;
 #[non_exhaustive]
 #[derive(Debug, Error, Diagnostic)]
 pub enum ResolveError {
+    #[error("index entry required for {0}")]
+    #[diagnostic(code(cabin::resolver::error))]
+    IndexEntryRequired(PackageName),
+
     #[error("package {0:?} was not found in index")]
     #[diagnostic(
         code(cabin::resolver::error),

@@ -92,13 +92,21 @@ requests for features the depended-on package does not declare all surface with 
 
 Effects on commands:
 
-- **`cabin resolve` / `update` / `fetch`** filter disabled optional dependencies declared on local
-  (workspace / path) packages out of the resolver / fetch / lockfile inputs.  Optional dependencies
-  declared on *registry* packages are skipped regardless of feature state.  A feature request on a
-  registry package does not enable that registry package's own optional dependencies.  Dev
-  dependencies remain excluded by default; system dependencies remain declaration-only.
-- **`cabin build`** sees the same filtered dep set, so a disabled optional dependency never enters
-  the build graph or links into ordinary C++ targets.
+- **`cabin resolve` / `update` / `fetch`** apply features to local and registry packages. Active
+  dependency edges combine their feature requests; defaults remain enabled whenever any active
+  edge requests them. Enabled features expand local implications, `dep:`, and `dep/feature`
+  entries, adding each enabled optional dependency's version requirement. Platform-inactive edges
+  neither enable packages nor request features. Disabled optional packages and their dependencies
+  may be absent from the index. Dev dependencies remain excluded by default; system dependencies
+  remain declaration-only.
+- **`cabin resolve` / `update`** write the same dependency lockfile as a build with the same feature
+  selection, without downloading archives. Turning a feature off removes packages it alone enabled
+  on the next resolution. `--locked` fails when newly enabled dependencies are missing from the lockfile.
+- **`cabin build`** downloads, compiles, and links enabled dependencies used by the target graph for
+  C and C++. A target's `deps` entry naming a disabled optional dependency fails with the dependency
+  name and an enabling feature, including when that package has not been downloaded. Requested
+  features missing from the selected package's manifest are diagnosed during build.
+- **`cabin vendor`** includes enabled optional dependencies and excludes disabled ones.
 - **`cabin package`** preserves `optional`, `features`, and `default-features` per dependency in the
   canonical metadata document.  Bare entries without overrides serialize as plain
   version-requirement strings so older readers stay happy.
@@ -167,7 +175,7 @@ target that always builds, use `[target.'cfg(feature = "...")'.profile]` layers 
 
 ## CLI selection
 
-`cabin build` / `cabin resolve` / `cabin metadata` accept the same selection flag bundle:
+`cabin build` / `cabin resolve` / `cabin update` / `cabin metadata` accept the same selection flag bundle:
 
 ```
 --features <names>          # repeatable; each value may be comma-separated
@@ -220,10 +228,16 @@ index file.  `cabin-index` (local file index) and `cabin-index-http` (sparse HTT
 optional `features` field on every version entry and preserve it on `VersionMetadata`.  Older
 registry entries that omit the field continue to load.
 
-The resolver consults package features and dependency feature requests when deciding whether
-optional package dependencies declared on local (workspace / path) packages are active.  Optional
-dependencies declared on registry packages are conservatively skipped: their per-edge `features` /
-`default-features` requests round-trip through registry metadata, but transitive feature state for
-registry packages does not gate them on.  The lockfile records resolved registry versions only;
-per-`BuildConfiguration` state lives in the run-time fingerprint and is not persisted to
-`cabin.lock`.
+The version resolver uses index feature metadata to activate optional registry edges while solving
+version requirements. If an enabled dependency cannot resolve, it tries other versions of the
+package or its dependents. Feature requests from rejected registry versions do not activate packages
+in the final solution. Sparse HTTP indexes fetch package metadata only when resolution needs it;
+missing transitive packages permit backtracking.
+
+A `[patch]` replacement receives the union of requests for the replaced package, including names
+that only the replacement declares. Its own manifest supplies its features and defaults, and its
+edges and local path dependencies forward requests normally. Enabled optional dependencies also
+participate in native `links` collision checks during resolution or build.
+
+The lockfile records resolved registry versions and dependency edges; per-`BuildConfiguration`
+feature state lives in the run-time fingerprint and is not persisted to `cabin.lock`.

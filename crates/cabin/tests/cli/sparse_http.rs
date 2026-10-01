@@ -9,6 +9,7 @@ pub(crate) struct TestServer {
     server: Arc<tiny_http::Server>,
     thread: Option<JoinHandle<()>>,
     url: String,
+    requests: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl TestServer {
@@ -18,12 +19,15 @@ impl TestServer {
         let addr = server.server_addr().to_ip().expect("loopback addr");
         let url = format!("http://{addr}");
         let server_for_thread = Arc::clone(&server);
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let thread_requests = Arc::clone(&requests);
         let thread = std::thread::spawn(move || {
             loop {
                 let Ok(req) = server_for_thread.recv() else {
                     break;
                 };
                 let raw_url = req.url().to_string();
+                thread_requests.lock().unwrap().push(raw_url.clone());
                 let path = raw_url
                     .split('?')
                     .next()
@@ -53,11 +57,16 @@ impl TestServer {
             server,
             thread: Some(thread),
             url,
+            requests,
         }
     }
 
     pub(crate) fn url(&self) -> &str {
         &self.url
+    }
+
+    pub(crate) fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
     }
 }
 

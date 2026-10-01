@@ -337,6 +337,14 @@ pub(crate) fn prepare_workspace(
             pipeline.activated_patches,
         )
     } else {
+        if !args.locked && !args.frozen {
+            super::resolve::clear_resolution_lockfile(
+                &manifest_path,
+                &active_patches,
+                &effective_config.source_replacements,
+                args.no_patches,
+            )?;
+        }
         (
             Vec::new(),
             BTreeSet::new(),

@@ -42,13 +42,13 @@ use pubgrub::{PubGrubError, Ranges};
 use semver::{Version, VersionReq};
 
 pub use error::{ResolveError, ResolverConstraint};
-pub use input::{LinksClaim, LockedVersion, ResolveInput, ResolveMode};
+pub use input::{LinksClaim, LocalFeaturePackage, LockedVersion, ResolveInput, ResolveMode};
 pub use output::{BlockedRequirement, HeldBack, ResolveOutput, ResolvedPackage, ResolvedSource};
 
 use crate::explanation::explain_no_solution;
 use crate::output::selected_dependencies_to_output;
 use crate::preflight::{effective_locked, preflight_root_dependencies};
-use crate::provider::Provider;
+use crate::provider::{Provider, SolverPackage};
 use crate::range::req_to_range;
 
 /// Resolve `input`'s versioned dependencies against `index`.
@@ -100,7 +100,13 @@ fn resolve_once(input: &ResolveInput, index: &PackageIndex) -> Result<ResolveOut
     // not in `resolve` - so `resolve_packages` (build/run/test/
     // vendor) enforces it too, and before any lockfile is written
     // from this output.
-    detect_links_collision(&links_claims_of_solution(input, index, &output.packages))?;
+    let mut claims = links_claims_of_solution(input, index, &output.packages);
+    for name in output.features.keys() {
+        if let Some(local) = input.local_feature_packages.get(name) {
+            claims.extend(local.links.iter().cloned());
+        }
+    }
+    detect_links_collision(&claims)?;
     Ok(output)
 }
 
@@ -158,25 +164,22 @@ fn resolve_once_unchecked(
         root_dependencies,
     );
 
-    let solution = match pubgrub::resolve(
-        &provider,
-        input.root_name.clone(),
-        input.root_version.clone(),
-    ) {
-        Ok(solution) => solution,
-        Err(PubGrubError::NoSolution(tree)) => {
-            return Err(explain_no_solution(tree, &input.root_name));
-        }
-        // `ErrorChoosingVersion`, `ErrorRetrievingDependencies`,
-        // and `ErrorInShouldCancel` all bubble a provider-side
-        // `ResolveError` back out - surface the original
-        // variant.
-        Err(
-            PubGrubError::ErrorChoosingVersion { source, .. }
-            | PubGrubError::ErrorRetrievingDependencies { source, .. }
-            | PubGrubError::ErrorInShouldCancel(source),
-        ) => return Err(source),
-    };
+    let solution =
+        match pubgrub::resolve(&provider, SolverPackage::Root, input.root_version.clone()) {
+            Ok(solution) => solution,
+            Err(PubGrubError::NoSolution(tree)) => {
+                return Err(explain_no_solution(tree, &input.root_name));
+            }
+            // `ErrorChoosingVersion`, `ErrorRetrievingDependencies`,
+            // and `ErrorInShouldCancel` all bubble a provider-side
+            // `ResolveError` back out - surface the original
+            // variant.
+            Err(
+                PubGrubError::ErrorChoosingVersion { source, .. }
+                | PubGrubError::ErrorRetrievingDependencies { source, .. }
+                | PubGrubError::ErrorInShouldCancel(source),
+            ) => return Err(source),
+        };
 
     Ok(selected_dependencies_to_output(input, solution))
 }
@@ -212,7 +215,9 @@ fn links_claims_of_solution(
         if package.source == ResolvedSource::Root {
             continue;
         }
-        if input.locally_supplied.contains(&package.name) || !reachable.contains(&package.name) {
+        if input.locally_supplied.contains(&package.name)
+            || (input.local_feature_packages.is_empty() && !reachable.contains(&package.name))
+        {
             continue;
         }
         let Some(meta) = index
@@ -331,6 +336,7 @@ pub fn enforce_fork_version_requirements(
     fork_versions: &BTreeMap<PackageName, Version>,
     roots: &BTreeSet<PackageName>,
     locally_supplied: &BTreeSet<PackageName>,
+    enabled_optional_dependencies: &BTreeMap<PackageName, BTreeSet<PackageName>>,
 ) -> Result<(), cabin_core::PatchValidationError> {
     if fork_versions.is_empty() {
         return Ok(());
@@ -352,7 +358,10 @@ pub fn enforce_fork_version_requirements(
             continue;
         };
         for (dep_name, dep) in &meta.dependencies {
-            if dep.optional || !dep.is_active_for(&platform) {
+            let enabled = enabled_optional_dependencies
+                .get(&package.name)
+                .is_some_and(|deps| deps.contains(dep_name));
+            if !dep.matches_platform(&platform) || (dep.optional && !enabled) {
                 continue;
             }
             let Some(version) = fork_versions.get(dep_name) else {
@@ -410,7 +419,7 @@ fn reachable_index_selections<'a, 'b>(
             continue;
         };
         for (dep_name, dep_entry) in &meta.dependencies {
-            if !dep_entry.is_active_for(&platform) {
+            if !dep_entry.matches_platform(&platform) {
                 continue;
             }
             if let Some((key, _)) = selected.get_key_value(dep_name)
@@ -829,6 +838,262 @@ mod tests {
             deps.insert(pkg_name(n), req(r));
         }
         ResolveInput::new(pkg_name("app"), version("0.1.0"), deps)
+    }
+
+    fn feature_entry(
+        name: &str,
+        versions: Vec<VersionSpec<'_>>,
+        feature: &str,
+        enables: &str,
+    ) -> IndexEntry {
+        let mut package = entry(name, versions);
+        for meta in package.versions.values_mut() {
+            meta.features = Some(
+                serde_json::json!({ "default": [feature], "features": { feature: [enables] } }),
+            );
+            for edge in meta.dependencies.values_mut() {
+                edge.optional = true;
+            }
+        }
+        package
+    }
+
+    #[test]
+    fn registry_defaults_enable_optional_dependencies_and_links_claims() {
+        let mut leaf = entry("leaf", vec![("1.0.0", vec![], false)]);
+        leaf.versions
+            .get_mut(&version("1.0.0"))
+            .unwrap()
+            .links
+            .insert("leaf".into(), "native".into());
+        let mut parent = feature_entry(
+            "parent",
+            vec![("1.0.0", vec![("leaf", "^1")], false)],
+            "extra",
+            "dep:leaf",
+        );
+        parent
+            .versions
+            .get_mut(&version("1.0.0"))
+            .unwrap()
+            .links
+            .insert("parent".into(), "native".into());
+        let index = build_index(vec![parent, leaf]);
+        assert!(matches!(
+            resolve(&make_input(vec![("parent", "^1")]), &index),
+            Err(ResolveError::LinksCollision { .. })
+        ));
+    }
+
+    #[test]
+    fn missing_enabled_optional_dependency_backtracks_without_leaking_features() {
+        let mut parent = entry(
+            "parent",
+            vec![
+                ("1.0.0", vec![("shared", "^1")], false),
+                ("1.1.0", vec![("shared", "^1"), ("missing", "^1")], false),
+            ],
+        );
+        let latest = parent.versions.get_mut(&version("1.1.0")).unwrap();
+        latest
+            .dependencies
+            .get_mut(&pkg_name("missing"))
+            .unwrap()
+            .optional = true;
+        latest
+            .dependencies
+            .get_mut(&pkg_name("shared"))
+            .unwrap()
+            .features = vec!["extra".into()];
+        latest.features =
+            Some(serde_json::json!({ "default": ["bad"], "features": { "bad": ["dep:missing"] } }));
+        let shared = feature_entry(
+            "shared",
+            vec![("1.0.0", vec![("leaked", "^1")], false)],
+            "extra",
+            "dep:leaked",
+        );
+        let mut shared = shared;
+        shared
+            .versions
+            .get_mut(&version("1.0.0"))
+            .unwrap()
+            .features
+            .as_mut()
+            .unwrap()["default"] = serde_json::json!([]);
+        let index = build_index(vec![
+            parent,
+            shared,
+            entry("leaked", vec![("1.0.0", vec![], false)]),
+        ]);
+        let output = resolve(&make_input(vec![("parent", "^1")]), &index).unwrap();
+        assert_eq!(
+            output
+                .packages
+                .iter()
+                .find(|p| p.name == pkg_name("parent"))
+                .unwrap()
+                .version,
+            version("1.0.0")
+        );
+        assert!(!output.packages.iter().any(|p| p.name == pkg_name("leaked")));
+        assert!(!output.features[&pkg_name("shared")].contains("extra"));
+    }
+
+    #[test]
+    fn optional_requirements_backtrack_dependents_when_no_parent_version_works() {
+        let parent = feature_entry(
+            "parent",
+            vec![("1.0.0", vec![("missing", "^1")], false)],
+            "extra",
+            "dep:missing",
+        );
+        let dependent = entry(
+            "dependent",
+            vec![
+                ("1.0.0", vec![], false),
+                ("1.1.0", vec![("parent", "^1")], false),
+            ],
+        );
+        let output = resolve(
+            &make_input(vec![("dependent", "^1")]),
+            &build_index(vec![parent, dependent]),
+        )
+        .unwrap();
+        assert_eq!(output.packages.len(), 2);
+        assert_eq!(output.packages[1].version, version("1.0.0"));
+    }
+
+    #[test]
+    fn every_incoming_edge_must_disable_registry_defaults() {
+        let shared = feature_entry(
+            "shared",
+            vec![("1.0.0", vec![("leaf", "^1")], false)],
+            "extra",
+            "dep:leaf",
+        );
+        let mut left = entry("left", vec![("1.0.0", vec![("shared", "^1")], false)]);
+        left.versions
+            .get_mut(&version("1.0.0"))
+            .unwrap()
+            .dependencies
+            .get_mut(&pkg_name("shared"))
+            .unwrap()
+            .default_features = false;
+        let mut right = entry("right", vec![("1.0.0", vec![("shared", "^1")], false)]);
+        let mut index = build_index(vec![
+            shared,
+            left,
+            right.clone(),
+            entry("leaf", vec![("1.0.0", vec![], false)]),
+        ]);
+        let input = make_input(vec![("left", "^1"), ("right", "^1")]);
+        assert!(
+            resolve(&input, &index)
+                .unwrap()
+                .packages
+                .iter()
+                .any(|p| p.name == pkg_name("leaf"))
+        );
+        right
+            .versions
+            .get_mut(&version("1.0.0"))
+            .unwrap()
+            .dependencies
+            .get_mut(&pkg_name("shared"))
+            .unwrap()
+            .default_features = false;
+        index.packages.insert(pkg_name("right"), right);
+        assert!(
+            !resolve(&input, &index)
+                .unwrap()
+                .packages
+                .iter()
+                .any(|p| p.name == pkg_name("leaf"))
+        );
+    }
+
+    #[test]
+    fn registry_dep_feature_entries_activate_optional_edges_and_their_requirements() {
+        let mut parent = feature_entry(
+            "parent",
+            vec![("1.0.0", vec![("leaf", "^1")], false)],
+            "extra",
+            "leaf/extra",
+        );
+        parent
+            .versions
+            .get_mut(&version("1.0.0"))
+            .unwrap()
+            .dependencies
+            .get_mut(&pkg_name("leaf"))
+            .unwrap()
+            .default_features = false;
+        let leaf = feature_entry(
+            "leaf",
+            vec![("1.0.0", vec![("last", "^1")], false)],
+            "extra",
+            "dep:last",
+        );
+        let index = build_index(vec![
+            parent,
+            leaf,
+            entry("last", vec![("1.0.0", vec![], false)]),
+        ]);
+        let output = resolve(&make_input(vec![("parent", "^1")]), &index).unwrap();
+        assert!(output.packages.iter().any(|p| p.name == pkg_name("last")));
+    }
+
+    #[test]
+    fn enabled_optional_dependencies_constrain_the_selected_version() {
+        let parent = feature_entry(
+            "parent",
+            vec![
+                ("1.0.0", vec![("leaf", "^1")], false),
+                ("1.1.0", vec![("leaf", "^2")], false),
+            ],
+            "extra",
+            "dep:leaf",
+        );
+        let index = build_index(vec![parent, entry("leaf", vec![("1.0.0", vec![], false)])]);
+        let output = resolve(&make_input(vec![("parent", "^1")]), &index).unwrap();
+        assert_eq!(
+            output
+                .packages
+                .iter()
+                .find(|package| package.name == pkg_name("parent"))
+                .unwrap()
+                .version,
+            version("1.0.0")
+        );
+    }
+
+    #[test]
+    fn platform_inactive_optional_edges_neither_enable_packages_nor_request_features() {
+        let mut parent = feature_entry(
+            "parent",
+            vec![("1.0.0", vec![("missing", "^1")], false)],
+            "extra",
+            "missing/extra",
+        );
+        let edge = parent
+            .versions
+            .get_mut(&version("1.0.0"))
+            .unwrap()
+            .dependencies
+            .get_mut(&pkg_name("missing"))
+            .unwrap();
+        edge.condition = Some(
+            cabin_core::Condition::parse_cfg(&format!(r#"cfg(os = "{}")"#, other_os())).unwrap(),
+        );
+        edge.features = vec!["unavailable".into()];
+        let output = resolve(
+            &make_input(vec![("parent", "^1")]),
+            &build_index(vec![parent]),
+        )
+        .unwrap();
+        assert_eq!(output.packages.len(), 2);
+        assert!(!output.features.contains_key(&pkg_name("missing")));
     }
 
     fn input_with_locked(
@@ -2209,9 +2474,15 @@ mod tests {
         let supplied: BTreeSet<PackageName> = [pkg_name("bbb")].into_iter().collect();
 
         let roots: BTreeSet<PackageName> = [pkg_name("aaa")].into_iter().collect();
-        let err =
-            enforce_fork_version_requirements(&packages, &index, &fork_versions, &roots, &supplied)
-                .unwrap_err();
+        let err = enforce_fork_version_requirements(
+            &packages,
+            &index,
+            &fork_versions,
+            &roots,
+            &supplied,
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             cabin_core::PatchValidationError::VersionMismatch { .. }
@@ -2226,6 +2497,7 @@ mod tests {
                 &fork_versions,
                 &no_roots,
                 &supplied,
+                &BTreeMap::new(),
             )
             .is_ok()
         );

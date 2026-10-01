@@ -19,6 +19,7 @@ semver = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 miette = { workspace = true, features = ["fancy"] }
 
 [lints]

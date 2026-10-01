@@ -8,6 +8,60 @@ use std::path::Path;
 
 use super::{PlanRequest, TargetDepEdge, TargetId, find_target, format_target_id};
 
+pub(super) fn check_optional_target_dependency(
+    raw: &str,
+    pkg_idx: usize,
+    dev_deps_visible: bool,
+    graph: &PackageGraph,
+    enabled: &std::collections::BTreeSet<String>,
+) -> Result<(), BuildError> {
+    let pkg = &graph.packages[pkg_idx].package;
+    let dependency = if let Some((name, _)) = raw.split_once(':') {
+        if name == pkg.name.as_str() {
+            return Ok(());
+        }
+        name
+    } else {
+        if find_target(pkg, raw).is_some() {
+            return Ok(());
+        }
+        raw
+    };
+    let platform = cabin_core::TargetPlatform::current();
+    let mut declarations: Vec<_> = pkg
+        .dependencies
+        .iter()
+        .filter(|dep| {
+            dep.name.as_str() == dependency
+                && (dep.kind == cabin_core::DependencyKind::Normal
+                    || (dev_deps_visible && dep.kind == cabin_core::DependencyKind::Dev))
+                && dep.matches_platform(&platform)
+        })
+        .collect();
+    if declarations
+        .iter()
+        .any(|dep| dep.kind == cabin_core::DependencyKind::Normal)
+    {
+        declarations.retain(|dep| dep.kind == cabin_core::DependencyKind::Normal);
+    }
+    if declarations.is_empty() || declarations.iter().any(|dep| !dep.optional) {
+        return Ok(());
+    }
+    let features = pkg.features.dependency_enabling_features(dependency);
+    if features.iter().any(|feature| enabled.contains(feature)) {
+        return Ok(());
+    }
+    let help = features.first().map_or_else(
+        || format!("add a feature containing \"dep:{dependency}\" to `[features]` and enable it"),
+        |feature| format!("enable feature {feature:?} on package {:?} (with `--features {feature}` for a selected package, or `features = [\"{feature}\"]` on its dependency edge)", pkg.name.as_str()),
+    );
+    Err(BuildError::OptionalDependencyNotEnabled {
+        dep: dependency.to_owned(),
+        package: pkg.name.as_str().to_owned(),
+        help,
+    })
+}
+
 /// Resolve one declared `deps` entry into a graph edge.  The alias
 /// forms (`foo` as a same-package target or as a dependency
 /// package's sole library-like target) resolve *before* the declared

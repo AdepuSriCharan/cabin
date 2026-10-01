@@ -71,6 +71,13 @@ pub enum BuildError {
     )]
     DevDependencyNotActive { dep: String, package: String },
 
+    #[error("optional dependency {dep:?} of package {package:?} is not enabled; {help}")]
+    OptionalDependencyNotEnabled {
+        dep: String,
+        package: String,
+        help: String,
+    },
+
     /// An explicitly selected target's `required-features` are not
     /// all enabled.  Default enumeration silently skips such
     /// targets; naming one (`cabin test --test`, `cabin run

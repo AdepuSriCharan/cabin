@@ -67,6 +67,23 @@ pub struct Features {
 }
 
 impl Features {
+    /// Features that directly enable a dependency. The resolved feature set
+    /// already contains any local implications leading to these features.
+    pub fn dependency_enabling_features(&self, dependency: &str) -> Vec<String> {
+        self.features
+            .iter()
+            .filter(|(_, entries)| {
+                entries.iter().any(|raw| match FeatureEntry::parse(raw) {
+                    Ok(FeatureEntry::OptionalDep(dep) | FeatureEntry::DepFeature { dep, .. }) => {
+                        dep == dependency
+                    }
+                    _ => false,
+                })
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     /// Convenience constructor for `Package::new`-style call sites.
     ///
     /// # Errors

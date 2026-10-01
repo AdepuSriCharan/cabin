@@ -100,22 +100,17 @@ Once patches are validated, Cabin treats them as *synthesized local-path package
   registry-fetch pass; the patched working copy never enters the artifact cache.
 - Feature resolution, dependency-kind handling, and target-conditioned dependencies flow through the
   patched manifest exactly as they would for any path dependency.
-- A patch reached only through registry metadata (nothing local names it, so activation is
-  discovered during resolution) has the `links` claims of its feature-enabled optional path
-  dependencies enforced by the building commands' final graph check (see
-  [`links`](manifest.md#links)), because those edges are not visible before resolution runs.  Index dependency edges onto the patched name -
-  visible only in the solution, so the pre-resolution validation above never saw them - are checked
-  once resolution completes: the fork's version must satisfy every selected dependent's
-  requirement, surfacing the same version-mismatch error.  Activation follows *live* edges only: a
-  patched name reachable solely through a replaced upstream's own index dependencies stays dormant,
-  because those edges die with the replacement (the fork's real dependencies take their place).  A
-  fork manifest that declares an
-  *optional versioned* dependency follows the same fetch policy as every other package: the
-  registry fetch materializes only edges the local feature resolution proves enabled (index-edge
-  feature requests are not consulted), and the building commands' final workspace reload requires
-  every versioned dependency an activated fork declares - so such a fork currently fails the build
-  naming the missing dependency.  Declare the fork's extras as path dependencies or non-optional
-  versioned dependencies instead.
+- A patch reached through registry metadata receives every active incoming feature request,
+  including features only its replacement manifest declares. The replacement's manifest supplies
+  both feature definitions and defaults; the replaced registry version's definitions do not apply.
+  Its own dependency edges and any local path dependencies forward feature requests normally.
+- Enabled optional path and registry dependencies of a replacement participate in resolution,
+  fetching, and `links` collision checks. Disabled optional dependencies need not exist in the
+  index and are not fetched. Index dependency edges onto the patched name are checked against the
+  replacement's version after resolution, including enabled optional edges.
+- Activation follows live edges: dependencies belonging solely to the replaced upstream do not
+  activate other patches. If a replacement enables an unavailable dependency, resolution may
+  choose an earlier dependent version or report an error.
 
 ## Source replacement syntax
 
